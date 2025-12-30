@@ -1,0 +1,637 @@
+// Filename: Morse_Code_Translator
+// Author: Raymond Chinn, Xander Geurkink
+// Date: 12/3/25
+// Description: A real-time FreeRTOS Morse Code Translator which enables two main functionalities:
+//              1) Morse translation through physical button input
+//              2) Serial Monitor text translation to audible buzzes
+// Version 1.0
+// ============================================================================
+// =============================== INCLUDES ===================================
+// ============================================================================
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+
+#include <Wire.h>
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
+#include <string.h>
+
+#include <string>
+#include <iostream>
+
+#include <cstring>   // For memcpy and memset
+#include <unistd.h>  // For usleep()
+// ============================================================================
+// =============================== MACROS =====================================
+// ============================================================================
+
+// ============================================================================
+// LCD CONFIGURATION
+// ============================================================================
+#define LCD_ADDR 0x27                    // I2C address for LCD
+LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);  // 16 columns x 2 rows
+
+// ============================================================================
+// HARDWARE PIN DEFINITIONS
+// ============================================================================
+#define LETTER_BUTTON 5  //  Pin for taps/holds button
+#define BREAK_BUTTON 6   // Pin for letter/word break button
+#define BUZZER_PIN 19    // Pin of buzzer for serial monitor translation
+
+// ============================================================================
+// BUZZER DEFINITIONS
+// ============================================================================
+#define PWM_FREQ 500       // Base PWM frequency in Hz
+#define PWM_RESOLUTION 13  // 13-bit resolution (0-8191 range)
+
+// ============================================================================
+// MORSE CODE TRANSLATIONS
+// ============================================================================
+#define DOT 1
+#define DASH 2
+#define EMPTY 0          // empty filler for word arrays
+#define MAX_MORSE_LEN 5  // Maximum length of a Morse Code sequence
+
+// ============================================================================
+// =========================== GLOBAL VARIABLES ===============================
+// ============================================================================
+
+// ============================================================================
+// BUTTON INTERRUPTS (ISRs)
+// ============================================================================
+volatile boolean letterButtonPressed = false;  // Flag indicating if letter button was pressed
+volatile boolean breakButtonPressed = false;   // Flag indicating if break button was pressed
+const int dot_dash_threshold = 1000;           // time threshold for dot -> dash
+
+// Global timing structure for ISRs
+typedef struct {
+  unsigned long press_time_us;
+  unsigned long release_time_us;
+} MorseTimingData_t;
+
+// Define a MorseTimingData_t instance for the Letter button ISR
+volatile MorseTimingData_t timingData;
+
+// Debounce tracking
+volatile unsigned long lastLetterInterruptTime = 0;  // Last timestamp a valid button press was detected
+volatile unsigned long lastBreakInterruptTime = 0;   // Last timestamp a valid button press was detected
+
+// ============================================================================
+// TASK TRANSITION
+// ============================================================================
+volatile boolean lastPressIsBreak = false;   // Flag for tracking if break button press is second
+                                             // consecutive, indicating word break instead of letter break
+volatile boolean translation_ready = false;  // Flag indicating if the input array is ready to be translated (set by breakLetter)
+
+SemaphoreHandle_t xBinarySemaphore;  // Binary semaphore to control shared data access between Tasks
+
+// ============================================================================
+// LETTER AND WORD STRUCTURES
+// ============================================================================
+
+volatile int input[MAX_MORSE_LEN];                 // Current working Morse letter
+volatile int translatedSerialChar[MAX_MORSE_LEN];  // Temp Morse sequence representing translated
+                                                   // char from Serial Monitor
+
+volatile char new_letter;                        // Current character translated from button input
+volatile int count;                              // Tracks current index of input array
+volatile char message[33] = "";                  // Holds message printed to LCD
+volatile int message_index = 0;                  // Tracks the current length/next write position
+const int MAX_MESSAGE_LEN = 32;                  // Max length of message (reserve 1 for '\0')
+const int LCD_WIDTH = 16;                        // Width of the LCD Device
+volatile boolean print_success_message = false;  // Flag indicating successful registering of DOT or DASH
+                                                 // to input and confirmation for success message print to Serial
+
+// ============================================================================
+// ======================= TASK FUNCTION PROTOTYPES ===========================
+// ============================================================================
+void Task_ButtonInput(void *pvParameters);
+void Task_TranslationLogic(void *pvParameters);
+void Task_LCDDisplay(void *pvParameters);
+void Task_SerialToMorse(void *pvParameters);
+
+// ============================================================================
+// MORSE CODE ALPHABET TABLES
+// ============================================================================
+
+// --- Data Structure for a Single Entry ---
+typedef struct {
+  char letter;
+  // The sequence array stores the DOT (1) and DASH (2) elements.
+  int sequence[MAX_MORSE_LEN];
+} MorseEntry_t;
+
+// =========================================================================
+// 1. Sequences starting with DOT-DOT
+// =========================================================================
+// Includes: E (.), I (..), S (...), H (....), V (...-), U (..-), F (..-.),
+//           2 (..---), 3 (...--), 4 (....-), 5 (.....)
+const MorseEntry_t MORSE_DOT_DOT_TABLE[] = {
+  // Letter | E1  E2  E3  E4  E5 | Morse
+  { 'E', { DOT, EMPTY, EMPTY, EMPTY, EMPTY } },  // .
+  { 'I', { DOT, DOT, EMPTY, EMPTY, EMPTY } },    // ..
+  { 'S', { DOT, DOT, DOT, EMPTY, EMPTY } },      // ...
+  { 'H', { DOT, DOT, DOT, DOT, EMPTY } },        // ....
+  { 'V', { DOT, DOT, DOT, DASH, EMPTY } },       // ...-
+  { 'U', { DOT, DOT, DASH, EMPTY, EMPTY } },     // ..-
+  { 'F', { DOT, DOT, DASH, DOT, EMPTY } },       // ..-.
+  { '5', { DOT, DOT, DOT, DOT, DOT } },          // .....
+  { '4', { DOT, DOT, DOT, DOT, DASH } },         // ....-
+  { '3', { DOT, DOT, DOT, DASH, DASH } },        // ...--
+  { '2', { DOT, DOT, DASH, DASH, DASH } },       // ..---
+};
+const size_t MORSE_DOT_DOT_SIZE = sizeof(MORSE_DOT_DOT_TABLE) / sizeof(MORSE_DOT_DOT_TABLE[0]);
+
+// =========================================================================
+// 2. Sequences starting with DOT-DASH
+// =========================================================================
+// Includes: A (.-), R (.-.), L (.-..), W (.--), P (.--.), J (.---), 1 (.----)
+const MorseEntry_t MORSE_DOT_DASH_TABLE[] = {
+  // Letter | E1  E2  E3  E4  E5 | Morse
+  { 'A', { DOT, DASH, EMPTY, EMPTY, EMPTY } },  // .-
+  { 'R', { DOT, DASH, DOT, EMPTY, EMPTY } },    // .-.
+  { 'L', { DOT, DASH, DOT, DOT, EMPTY } },      // .-..
+  { 'W', { DOT, DASH, DASH, EMPTY, EMPTY } },   // .--
+  { 'P', { DOT, DASH, DASH, DOT, EMPTY } },     // .--.
+  { 'J', { DOT, DASH, DASH, DASH, EMPTY } },    // .---
+  { '1', { DOT, DASH, DASH, DASH, DASH } },     // .----
+};
+const size_t MORSE_DOT_DASH_SIZE = sizeof(MORSE_DOT_DASH_TABLE) / sizeof(MORSE_DOT_DASH_TABLE[0]);
+
+// =========================================================================
+// 3. Sequences starting with DASH-DOT
+// =========================================================================
+// Includes: T (-), N (-.), D (-..), B (-...), X (-..-), K (-.-), C (-.-.),
+//           Y (-.--), 6 (-....)
+const MorseEntry_t MORSE_DASH_DOT_TABLE[] = {
+  // Letter | E1  E2  E3  E4  E5 | Morse
+  { 'T', { DASH, EMPTY, EMPTY, EMPTY, EMPTY } },  // -
+  { 'N', { DASH, DOT, EMPTY, EMPTY, EMPTY } },    // -.
+  { 'D', { DASH, DOT, DOT, EMPTY, EMPTY } },      // -..
+  { 'B', { DASH, DOT, DOT, DOT, EMPTY } },        // -...
+  { 'X', { DASH, DOT, DOT, DASH, EMPTY } },       // -..-
+  { 'K', { DASH, DOT, DASH, EMPTY, EMPTY } },     // -.-
+  { 'C', { DASH, DOT, DASH, DOT, EMPTY } },       // -.-.
+  { 'Y', { DASH, DOT, DASH, DASH, EMPTY } },      // -.--
+  { '6', { DASH, DOT, DOT, DOT, DOT } },          // -....
+};
+const size_t MORSE_DASH_DOT_SIZE = sizeof(MORSE_DASH_DOT_TABLE) / sizeof(MORSE_DASH_DOT_TABLE[0]);
+
+// =========================================================================
+// 4. Sequences starting with DASH-DASH
+// =========================================================================
+// Includes: M (--), G (--.), Z (--..), Q (--.-), O (---), 7 (-..-), 8 (---..),
+//           9 (----.), 0 (-----)
+const MorseEntry_t MORSE_DASH_DASH_TABLE[] = {
+  // Letter | E1  E2  E3  E4  E5 | Morse
+  { 'M', { DASH, DASH, EMPTY, EMPTY, EMPTY } },  // --
+  { 'G', { DASH, DASH, DOT, EMPTY, EMPTY } },    // --.
+  { 'Z', { DASH, DASH, DOT, DOT, EMPTY } },      // --..
+  { 'Q', { DASH, DASH, DOT, DASH, EMPTY } },     // --.-
+  { 'O', { DASH, DASH, DASH, EMPTY, EMPTY } },   // ---
+  { '7', { DASH, DASH, DOT, DOT, DOT } },        // --...
+  { '8', { DASH, DASH, DASH, DOT, DOT } },       // ---..
+  { '9', { DASH, DASH, DASH, DASH, DOT } },      // ----.
+  { '0', { DASH, DASH, DASH, DASH, DASH } },     // -----
+};
+const size_t MORSE_DASH_DASH_SIZE = sizeof(MORSE_DASH_DASH_TABLE) / sizeof(MORSE_DASH_DASH_TABLE[0]);
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Name: addDotOrDash
+// Description: Takes a Morse tap (DOT or DASH) and adds it to the input array
+void addDotOrDash(int MorseTap) {
+  if (count < MAX_MORSE_LEN) {
+    input[count] = MorseTap;
+    count++;
+    print_success_message = true;  // Flip flag to print MorseTap to Serial Monitor
+
+  } else {
+    Serial.println("Letter is full: press BREAK");
+  }
+}
+
+// Name: breakLetter
+// Description: Fills remaining empty input array cells with EMPTYs (0)
+void breakLetter() {
+  for (int i = count; i < 5; i++) {
+    input[i] = EMPTY;
+  }
+  // Reset count and flip flag to indicate input is full and ready for translation
+  count = 0;
+  translation_ready = true; 
+}
+
+// Name:
+// Description: Helper to compare two Morse sequences element by element.
+// This replaces the broken pointer comparison (input == table.sequence).
+bool compareMorseSequences(volatile const int *seq1, const int *seq2, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    if (seq1[i] != seq2[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Name: translateToMorse
+// Description: Takes a char c and finds its corresponding morse sequence
+void translateToMorse(char c) {
+  // Convert to uppercase
+  c = toupper(c);
+
+  // Parse through Morse alphabet tables to find char-sequence pair and copies
+  // it to translatedSerialChar array
+  // Returns if a match is found
+  for (int i = 0; i < MORSE_DOT_DOT_SIZE; i++) {
+    if (c == MORSE_DOT_DOT_TABLE[i].letter) {
+      std::memcpy(
+        (void *)translatedSerialChar,  // Cast away 'volatile'
+        MORSE_DOT_DOT_TABLE[i].sequence,
+        sizeof(translatedSerialChar));
+      return;
+    }
+  }
+  for (int i = 0; i < MORSE_DOT_DASH_SIZE; i++) {
+    if (c == MORSE_DOT_DASH_TABLE[i].letter) {
+      std::memcpy(
+        (void *)translatedSerialChar,  // Cast away 'volatile'
+        MORSE_DOT_DASH_TABLE[i].sequence,
+        sizeof(translatedSerialChar));
+      return;
+    }
+  }
+  for (int i = 0; i < MORSE_DASH_DOT_SIZE; i++) {
+    if (c == MORSE_DASH_DOT_TABLE[i].letter) {
+      std::memcpy(
+        (void *)translatedSerialChar,  // Cast away 'volatile'
+        MORSE_DASH_DOT_TABLE[i].sequence,
+        sizeof(translatedSerialChar));
+      return;
+    }
+  }
+  for (int i = 0; i < MORSE_DASH_DASH_SIZE; i++) {
+    if (c == MORSE_DASH_DASH_TABLE[i].letter) {
+      std::memcpy(
+        (void *)translatedSerialChar,  // Cast away 'volatile'
+        MORSE_DASH_DASH_TABLE[i].sequence,
+        sizeof(translatedSerialChar));
+      return;
+    }
+  }
+
+  // Edge case: if no match, copy an EMPTY array into translatedSerialChar array
+  std::memset((void *)translatedSerialChar, EMPTY, sizeof(translatedSerialChar));
+}
+
+// Name: buzzBuzzer
+// Description: Takes a Morse sequence as an int[] and creates a Morse Code buzzing
+//              sequence based on a character's DOT/DASH arrangement
+//              DOT and DASH vary in buzz sound frequency and duration
+void buzzBuzzer(const volatile int *seq) {
+
+  // Process each element of the Morse sequence
+  for (int i = 0; i < 5; i++) {
+    // Case 1: element i of the Morse sequence seq is a DOT
+    if (seq[i] == DOT) {
+      int frequency = 262;
+      ledcChangeFrequency(BUZZER_PIN, frequency, PWM_RESOLUTION);
+      ledcWrite(BUZZER_PIN, 1023);  // Set duty cycle for audible sound range
+      delay(500);
+      ledcChangeFrequency(BUZZER_PIN, 0, PWM_RESOLUTION);
+      ledcWrite(BUZZER_PIN, 0);
+      delay(100);
+
+      // Case 2: element i of the Morse sequence seq is a DASH
+    } else if (seq[i] == DASH) {
+      int frequency = 300;
+      ledcChangeFrequency(BUZZER_PIN, frequency, PWM_RESOLUTION);
+      ledcWrite(BUZZER_PIN, 1023);  // Set duty cycle for audible sound range
+      delay(1000);
+      ledcChangeFrequency(BUZZER_PIN, 0, PWM_RESOLUTION);
+      ledcWrite(BUZZER_PIN, 0);
+      delay(100);
+
+      // Case 3: element i of the Morse sequence seq is EMPTY (end of sequence) -> return
+    } else {
+      // short delay to audibly break up letters
+      delay(400);
+      return;
+    }
+  }
+ 
+}
+
+// =========================================================================
+// === Button ISRs (with Debounce)
+// =========================================================================
+
+// Name: handleLetterButtonInterrupt
+// Description: ISR for LETTER_BUTTON. Triggers on both button press (FALLING edge) and
+//              release (RISING edge) and records current time for press duration calculation
+void IRAM_ATTR handleLetterButtonInterrupt() {
+  unsigned long currentTime = millis();  // Read current time (in ms)
+
+  // Debounce: Delay for switch signal to stop bouncing
+  usleep(1000);
+
+  // Update last valid press time
+  lastLetterInterruptTime = currentTime;
+
+  // Read the pin state to determine if it's a press or release
+  bool is_pressed = (digitalRead(LETTER_BUTTON) == LOW);
+
+  if (is_pressed) {
+    // --- VALID FALLING EDGE (Press = Start) ---
+    timingData.press_time_us = currentTime;
+  } else {
+    // --- VALID RISING EDGE (Release = End) ---
+    timingData.release_time_us = currentTime;
+    letterButtonPressed = true;  // Flag that button was completely pressed and released
+  }
+}
+
+// Name: handleBreakButtonInterrupt
+// Description: ISR for BREAK_BUTTON. Triggers and records time of button press (FALLING edge)
+void IRAM_ATTR handleBreakButtonInterrupt() {
+  unsigned long currentTime = millis();  // Read current time (in ms)
+
+  // Debounce: Delay for switch signal to stop bouncing
+  usleep(15000);
+
+  // Read the pin state to determine if it is being pressed
+  if (digitalRead(BREAK_BUTTON) == LOW) {
+    lastBreakInterruptTime = currentTime;  // Update last valid press time
+    breakButtonPressed = true;             // Flag that button was pressed
+  }
+}
+
+// =========================================================================
+// TASK FUNCTIONS
+// =========================================================================
+
+// Name: Task_ButtonInput (Core 0)
+// Description: Receives ISR dat, handles break button logic, and populates the 
+//              input array with DOTs and DASHes. Gives up semaphore after completion 
+void Task_ButtonInput(void *pvParameters) {
+  while (1) {
+    if (xSemaphoreTake(xBinarySemaphore, 0) == pdTRUE) {
+      // Flag from letter button ISR 
+      // Ensures we are only processing a release, not just a press
+      if (letterButtonPressed) {
+
+        lastPressIsBreak = false;     // // Flip flag to indicate last button press as a break
+        letterButtonPressed = false;  // Reset state
+
+        // Calculate duration of press (release time - press time)
+        unsigned long press_duration = timingData.release_time_us - timingData.press_time_us;
+
+        // Case 1 (Register as DOT): Letter button is held for less than the dot/dash threshold
+        if (press_duration < dot_dash_threshold) {
+          addDotOrDash(DOT);
+          if (print_success_message) {
+            print_success_message = false; // Reset flag
+            Serial.println("DOT");
+          }
+
+          // Case 2 (Register as DASH): Letter button is held longer than dot/dash threshold
+        } else {
+          addDotOrDash(DASH);
+          if (print_success_message) {
+            print_success_message = false; // Reset flag
+            Serial.println("DASH");
+          }
+        }
+      }
+
+      // Execute if the break button has been pressed
+      if (breakButtonPressed) {
+
+        // Check lastPressIsBreak flag to see if the last button pressed was a break
+        // If the last button press was NOT break, then this break is a LETTER break (new letter)
+        // Logic: Two consecutive break presses = word break
+        //        One break press = letter break
+        if (!lastPressIsBreak) {
+          breakLetter();
+          Serial.println("New Letter\n");
+          lastPressIsBreak = true;  // Flip flag to indicate last button press as a break
+          breakButtonPressed = false; // Reset state
+
+        // If the last button press was break, then perform a WORD break (new word)
+        } else {
+          
+          // Add a space to message to start a new word
+          if (message_index < MAX_MESSAGE_LEN) {
+            message[message_index] = ' ';
+            message_index++;
+            message[message_index] = '\0';  // End string with null terminator
+          } else {
+            // Handle overflow
+            Serial.println("Error: Message buffer full!");
+          }
+
+          Serial.println("New word\n");
+          lastPressIsBreak = false; 
+          breakButtonPressed = false;  // Reset flag
+        }
+      }
+      xSemaphoreGive(xBinarySemaphore);
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));  // Small delay to yield control
+  }
+}
+
+// Name:Task_TranslationLogic
+// Description: Translates Morse sequence (input array)  of DOTs and DASHes into 
+//              its corresponding letter/number using Morse alphabet tables
+void Task_TranslationLogic(void *pvParameters) {
+  while (1) {
+    // Only execute if input is full and ready for translation (flipped by breakLetter())
+    if (translation_ready) {
+      if (xSemaphoreTake(xBinarySemaphore, 0) == pdTRUE) {
+        char foundLetter = '\0';  // Flag for whether the input was translated into a letter
+
+        // Search for matching sequence-letter pair based on input's first two elements
+        if (input[0] == DOT) {
+          // 1) Search DOT-DOT table
+          if (input[1] == DOT || input[1] == EMPTY) {
+            for (int i = 0; i < MORSE_DOT_DOT_SIZE; i++) {
+              if (compareMorseSequences(input, MORSE_DOT_DOT_TABLE[i].sequence, MAX_MORSE_LEN)) {
+                new_letter = MORSE_DOT_DOT_TABLE[i].letter;
+              }
+            }
+
+          // 2) Search DOT-DASH table
+          } else if (input[1] == DASH) {
+            for (int i = 0; i < MORSE_DOT_DASH_SIZE; i++) {
+              if (compareMorseSequences(input, MORSE_DOT_DASH_TABLE[i].sequence, MAX_MORSE_LEN)) {
+                new_letter = MORSE_DOT_DASH_TABLE[i].letter;
+              }
+            }
+          }
+                      
+        // 3) Search DASH-DOT table
+        } else if (input[0] == DASH) {
+          if (input[1] == DOT || input[1] == EMPTY) {
+            for (int i = 0; i < MORSE_DASH_DOT_SIZE; i++) {
+              if (compareMorseSequences(input, MORSE_DASH_DOT_TABLE[i].sequence, MAX_MORSE_LEN)) {
+                new_letter = MORSE_DASH_DOT_TABLE[i].letter;
+              }
+            }
+
+          // 4) Search DASH-DASH table
+          } else if (input[1] == DASH) {
+            for (int i = 0; i < MORSE_DASH_DASH_SIZE; i++) {
+              if (compareMorseSequences(input, MORSE_DASH_DASH_TABLE[i].sequence, MAX_MORSE_LEN)) {
+                new_letter = MORSE_DASH_DASH_TABLE[i].letter;
+              }
+            }
+          }
+        }
+        
+        // Update foundLetter
+        foundLetter = new_letter;
+
+        // If a letter corresponding to input was found, update the working message for printing
+        if (foundLetter != '\0') {
+          // Check if the current message length exceeds LCD device width (2 rows * 16 chars = 32)
+          if (message_index < MAX_MESSAGE_LEN) {
+            message[message_index] = new_letter;
+            message_index++;
+            message[message_index] = '\0';  // End string with null terminator
+          } else {
+            // Message exceeds MAX_MESSAGE_LEN = 32 characters long
+            Serial.println("ERROR: Message exceeds 32 character limit: Please RESET");
+          }
+
+        // Else, found_letter is '\0', the input was not translated and nothing happens
+        } else {
+          // Handle invalid Morse Code (only if input[0] is not EMPTY)
+          if (input[0] != EMPTY) {
+            Serial.println("ERROR: Invalid Morse Sequence entered. Input cleared.");
+          }
+        }
+
+        // Clear input array, regardless of successful or failed translation
+        for (int i = 0; i < MAX_MORSE_LEN; i++) {
+          input[i] = EMPTY;
+        }
+        count = 0;  // Reset index tracker for input
+
+        // Reset flag once a translation attempt (failure or success) is comlpete
+        translation_ready = false;  
+
+        xSemaphoreGive(xBinarySemaphore);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));  // Small delay to yield control
+  }
+}
+
+
+// Name: Task_LCDDisplay
+// Description: Displays a message on the LCD 
+void Task_LCDDisplay(void *pvParameters) {
+  while (1) {
+    if (xSemaphoreTake(xBinarySemaphore, 0) == pdTRUE) {
+      lcd.clear();
+
+      // Temporary buffer for safely holding 16 characters + null terminator
+      char line_buffer[LCD_WIDTH + 1] = { 0 };
+
+      // --- ROW 0: FIRST 16 CHARACTERS ---
+      lcd.setCursor(0, 0);
+
+      // Copy the first 16 characters in message to line_buffer for printing on the ROW ZERO of the LCD
+      // Then, print the remaining characters to ROW ONE on the LCD
+      if (message_index > 0) {
+        // Copy a maximum of 16 characters from the beginning of the message (index 0)
+        snprintf(line_buffer, sizeof(line_buffer), "%s", (const char *)message);
+
+        lcd.print(line_buffer);
+      }
+
+      // --- ROW 1: REMAINING CHARACTERS (up to 16) ---0
+      lcd.setCursor(0, 1);
+
+      // If the message is longer the width of the LCD, start printing remaining
+      // message on the second row
+      if (message_index > LCD_WIDTH) {
+        int start_index = 16;
+        snprintf(line_buffer, sizeof(line_buffer), "%s", (const char *)&message[start_index]);
+
+        lcd.print(line_buffer);
+      }
+
+      xSemaphoreGive(xBinarySemaphore);
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));  // Small delay to yield control
+  }
+}
+
+// Name:Task_SerialToMorse
+// Description: Translates Serial Monitor text to Morse Code through buzzer output
+void Task_SerialToMorse(void *pvParameters) {
+  while (1) {
+    if (xSemaphoreTake(xBinarySemaphore, 0) == pdTRUE) {
+      // Runs if text is in the Serial Monitor (unprocessed)
+      if (Serial.available() > 0) {
+        while (Serial.available() > 0) {
+          char c = Serial.read();
+          translateToMorse(c); // Finds char c's Morse Code sequence and stores in translatedSerialChar
+          buzzBuzzer(translatedSerialChar); // Produces c's morse code sequence on the buzzer
+        }
+      }
+      xSemaphoreGive(xBinarySemaphore);
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));  // Small delay to yield control
+  }
+}
+
+// =========================================================================
+// SETUP AND LOOP
+// =========================================================================
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Real Time FreeRTOS Morse Code Translator\n");
+
+  // Configure GPIO pins
+  pinMode(LETTER_BUTTON, INPUT_PULLUP);  // (HIGH = released, LOW = pressed)
+  pinMode(BREAK_BUTTON, INPUT_PULLUP);   // (HIGH = released, LOW = pressed)
+  pinMode(BUZZER_PIN, OUTPUT);           // Configure BUZZER_PIN as an output
+
+  // Configures and LED Control (LEDC) in for PWM signal generation
+  ledcAttach(BUZZER_PIN, PWM_FREQ, PWM_RESOLUTION);
+
+  // Attach an external interrupt to the button pins
+  // CHANGE configuration triggers the ISR on both the RISING and FALLING edges for press and release time measurement
+  attachInterrupt(digitalPinToInterrupt(LETTER_BUTTON), handleLetterButtonInterrupt, CHANGE);
+  // FALLING configuration triggers the ISR on the FALLING edge
+  attachInterrupt(digitalPinToInterrupt(BREAK_BUTTON), handleBreakButtonInterrupt, FALLING);
+
+  // Configure LCD
+  lcd.init();
+  lcd.backlight();
+  delay(2);
+
+  // Task and Semaphore Generation
+  xBinarySemaphore = xSemaphoreCreateBinary();
+  if (xBinarySemaphore != NULL) {
+    // Core 0
+    xTaskCreatePinnedToCore(Task_ButtonInput, "Button Input", 2048, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(Task_TranslationLogic, "Translation Logic", 2048, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(Task_LCDDisplay, "LCD Display", 2048, NULL, 1, NULL, 0);
+
+    // Core 1
+    xTaskCreatePinnedToCore(Task_SerialToMorse, "Serial To Morse", 2048, NULL, 1, NULL, 1);
+
+    xSemaphoreGive(xBinarySemaphore);
+  }
+}
+
+
+void loop() {}
