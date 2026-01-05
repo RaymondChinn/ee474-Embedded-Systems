@@ -1,0 +1,253 @@
+/**
+ * @file Lab4_Part2.ino
+ * @author Raymond Chinn, Xander Geurkink
+ * @date 12/5/2025
+ * @brief This file demonstrates the concept of **semaphore scheduling** and 
+ * **priority scheduling** with FreeRTOS. 
+ * It also demonstrates the use of **multiple cores** for running tasks simultaneously.
+ * The core functionality is a light detection system that reads an analog light sensor,
+ * averages the data, displays it on an LCD, and triggers an alarm for anomalies, 
+ * all while sharing data access using a binary semaphore. A low-priority prime 
+ * calculation task runs on the second core.
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h" 
+#include "freertos/task.h" 
+#include "freertos/queue.h"
+#include "freertos/semphr.h" // Required for SemaphoreHandle_t and related functions
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Arduino.h> // Included for analogRead, Serial, etc.
+
+// =============================== MACROS ===============================
+/// Analog pin for reading light sensor voltage (A0 on some boards)
+#define lightRead 5
+/// Digital pin for the alarm LED
+#define LEDAlarm 4
+/// I2C address for the LCD display
+#define LCD_ADDR 0X27
+/// Command to clear the entire display (not used, but kept for reference)
+#define LCD_CLEAR_DISPLAY 0x01
+/// Command to set cursor to home position (not used, but kept for reference)
+#define LCD_CURSOR_HOME 0x80
+
+// ========================= GLOBAL VARIABLES ===========================
+
+/// LCD Configuration object
+LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
+
+/// FreeRTOS binary semaphore used for protecting access to shared global variables
+SemaphoreHandle_t xBinarySemaphore;
+
+/// The most recent light reading collected by Light_Detector
+volatile uint16_t dataGlobal;
+/// The calculated average of the last 5 light readings
+volatile uint16_t average;
+/// Count of valid readings in the data array (used for initial averaging)
+volatile int count;
+/// Array storing the last 5 light sensor readings
+volatile uint16_t data[5];
+
+// ========================= FUNCTION PROTOTYPES ===========================
+void Light_Detector(void* arg);
+void LCD(void* arg);
+void AnomalyAlarm(void* arg);
+void PrimeCalculation(void* arg);
+bool isPrime(int num);
+void setup();
+void loop();
+
+// ========================= FUNCTION DEFINITIONS ===========================
+
+/**
+ * @brief Initializes the hardware (pins, I2C, Serial) and creates all FreeRTOS tasks 
+ * and the binary semaphore.
+ * * It creates 4 tasks pinned to both cores, demonstrating core usage and priority scheduling.
+ */
+void setup() {
+    pinMode(lightRead, INPUT);
+    pinMode(LEDAlarm, OUTPUT);
+    
+    // Initialize I2C communication (adjust pins 8, 9 as needed for the target board)
+    Wire.begin(8, 9);
+    lcd.init();
+    lcd.backlight();
+    delay(2);
+
+    Serial.begin(115200);
+    
+    // Create the binary semaphore used for mutual exclusion
+    xBinarySemaphore = xSemaphoreCreateBinary();
+    
+    if (xBinarySemaphore != NULL) {
+        // Light_Detector: High priority (2) data collection on Core 0
+        xTaskCreatePinnedToCore(Light_Detector, "Light Detector", 2048, NULL, 2, NULL, 0);
+        // LCD: Low priority (1) display task on Core 0
+        xTaskCreatePinnedToCore(LCD, "LCD", 2048, NULL, 1, NULL, 0);
+        // AnomalyAlarm: Low priority (1) alarm task on Core 1
+        xTaskCreatePinnedToCore(AnomalyAlarm, "alarm anomaly", 2048, NULL, 1, NULL, 1);
+        // PrimeCalculation: High priority (2) CPU-intensive task on Core 1
+        xTaskCreatePinnedToCore(PrimeCalculation, "Prime Calc", 2048, NULL, 2, NULL, 1);
+        
+        // Give the semaphore initially so the first task can take it
+        xSemaphoreGive(xBinarySemaphore);
+    }
+}
+
+/**
+ * @brief Arduino main loop function.
+ * * Deletes itself as all scheduling is handled by FreeRTOS.
+ */
+void loop() {
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief Task that collects the light sensor reading, updates the running average 
+ * of the last 5 readings, and protects shared data access with a semaphore.
+ *
+ * @param arg Unused parameter (required by FreeRTOS task function signature).
+ */
+void Light_Detector(void* arg) {
+    while (1) {
+        // Attempt to take the semaphore immediately (non-blocking, 0 ticks)
+        if (xSemaphoreTake(xBinarySemaphore, 0) == pdTRUE) {
+            // Shift data array and add new reading
+            if (count < 5) {
+                for (int i = 0; i < count; i++) { // Only shift existing data
+                    data[i] = data[i + 1];
+                }
+                count++;
+            } else {
+                for (int i = 0; i < 4; i++) {
+                    data[i] = data[i + 1];
+                }
+            }
+            data[count - 1] = analogRead(lightRead);
+
+            // Calculate new average
+            float sum = 0;
+            for (int i = 0; i < count; i++) {
+                sum += data[i];
+            }
+            average = (uint16_t)(sum / count);
+            dataGlobal = data[count - 1]; // The most recent reading
+
+            // Release the semaphore
+            xSemaphoreGive(xBinarySemaphore); 
+        }
+        // Delay before taking the next reading (100 ms)
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+/**
+ * @brief Task that prints the calculated average and the newest light reading 
+ * to the I2C LCD display.
+ * * It only updates the display when the data has changed and protects shared 
+ * data access with a semaphore.
+ *
+ * @param arg Unused parameter (required by FreeRTOS task function signature).
+ */
+void LCD(void* arg) {
+    // Static variables to track the last displayed values
+    static uint16_t preAverage = 0; 
+    static uint16_t preData = 0;
+
+    while (1) {
+        // Attempt to take the semaphore immediately (non-blocking, 0 ticks)
+        if (xSemaphoreTake(xBinarySemaphore, 0) == pdTRUE) {
+            // Check if data has changed since last display
+            if (average != preAverage || dataGlobal != preData) {
+                lcd.clear();
+                lcd.setCursor(0, 0);
+                lcd.print("Average:");
+                lcd.print(average);
+                lcd.setCursor(0, 1);
+                lcd.print("New data: ");
+                lcd.print(dataGlobal);
+                
+                // Update tracking variables
+                preAverage = average;
+                preData = dataGlobal;
+            }
+            // Release the semaphore
+            xSemaphoreGive(xBinarySemaphore);
+        }
+        // Delay before checking the data again (1000 ms = 1 second)
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/**
+ * @brief Task that checks the calculated light average for anomaly conditions 
+ * (too high or too low) and flashes an LED alarm if an anomaly is detected.
+ * * It protects shared data access with a semaphore.
+ *
+ * @param arg Unused parameter (required by FreeRTOS task function signature).
+ */
+void AnomalyAlarm(void* arg) {
+    while (1) {
+        // Attempt to take the semaphore immediately (non-blocking, 0 ticks)
+        if (xSemaphoreTake(xBinarySemaphore, 0) == pdTRUE) {
+            // Anomaly condition: average is extremely high or extremely low
+            if (average > 3800 || average < 300) {
+                // Flash the alarm LED 3 times
+                for (int i = 0; i < 3; i++) {
+                    digitalWrite(LEDAlarm, HIGH);
+                    vTaskDelay(pdMS_TO_TICKS(200)); // Shortened delay for 200ms flash
+                    digitalWrite(LEDAlarm, LOW);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                }
+            } else {
+                 digitalWrite(LEDAlarm, LOW); // Ensure LED is off if no anomaly
+            }
+            // Release the semaphore
+            xSemaphoreGive(xBinarySemaphore); 
+        }
+        // Delay before checking the data again (1000 ms = 1 second)
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/**
+ * @brief CPU-intensive task that calculates and prints prime numbers up to 5000 
+ * to the Serial monitor.
+ * * This task is pinned to Core 1 and runs at a higher priority (2), potentially 
+ * preempting the AnomalyAlarm task on the same core.
+ *
+ * @param arg Unused parameter (required by FreeRTOS task function signature).
+ */
+void PrimeCalculation(void* arg) {
+    while (1) {
+        Serial.println("Starting Prime Calculation Cycle...");
+        for (int num = 2; num < 5000; num++) {
+            if (isPrime(num)) {
+                Serial.print("Prime: ");
+                Serial.println(num);
+            }
+        }
+        Serial.println("Prime Calculation Cycle Complete.");
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Delay for 5 seconds before restarting the cycle
+    }
+}
+
+/**
+ * @brief Helper function to check if a given integer is a prime number.
+ *
+ * @param num The integer to check for primality.
+ * @return bool Returns true if the number is prime, false otherwise.
+ */
+bool isPrime(int num) {
+    if (num <= 1) return false;
+    // Check for factors up to the square root of num
+    for (int i = 2; i * i <= num; i++) {
+        if (num % i == 0) {
+            return false;
+        }
+    }
+    return true;
+}
